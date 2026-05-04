@@ -141,16 +141,24 @@ class Qwen2_5VLPreEncoder(BaseHook):  # noqa: N801
             logger.error('pipeline_type must be passed when forwarding Qwen2_5VLPreEncoder.')
 
         # Calculate window attention cu_seqlens
-        window_index, cu_window_seqlens = get_window_index(image_grid_thw, self.config)
-        cu_window_seqlens = torch.tensor(cu_window_seqlens, device=image_grid_thw.device, dtype=image_grid_thw.dtype)
-        cu_window_seqlens = torch.unique_consecutive(cu_window_seqlens)
-
+        # Skip window attention for models without window (e.g. Qwen3-VL, window_size=0)
+        if self.config.window_size == 0:
+            window_index = None
+            cu_window_seqlens = None
+        else:
+            window_index, cu_window_seqlens = get_window_index(image_grid_thw, self.config)
         # Calculate normal attention cu_seqlens
         cu_seqlens = self.cumulative_sequencelens(image_grid_thw)
 
-        vision_attn_mask_window = precompute_qwen2_5vl_vision_attn_mask(
-            seq_length=seq_length, cu_seqlens=cu_window_seqlens, mask_value=self.config.mask_value
-        )
+        if cu_window_seqlens is not None:
+            cu_window_seqlens = torch.tensor(cu_window_seqlens, device=image_grid_thw.device, dtype=image_grid_thw.dtype)
+            cu_window_seqlens = torch.unique_consecutive(cu_window_seqlens)
+            vision_attn_mask_window = precompute_qwen2_5vl_vision_attn_mask(
+                seq_length=seq_length, cu_seqlens=cu_window_seqlens, mask_value=self.config.mask_value
+            )
+        else:
+            vision_attn_mask_window = None
+
         vision_attn_mask_normal = precompute_qwen2_5vl_vision_attn_mask(
             seq_length=seq_length, cu_seqlens=cu_seqlens, mask_value=self.config.mask_value
         )
@@ -177,8 +185,9 @@ class Qwen2_5VLPreEncoder(BaseHook):  # noqa: N801
             seq_len = arr.size()[0]
             arr = arr.reshape(seq_len // self.spatial_merge_unit, self.spatial_merge_unit, -1)
 
-            # GATHER OP implementation
-            arr = torch.index_select(arr, 0, window_index)
+            # GATHER OP implementation (skip if no window attention, e.g. Qwen3-VL)
+            if window_index is not None:
+                arr = torch.index_select(arr, 0, window_index)
             arr = arr.reshape(seq_len, -1).detach().cpu().numpy()
             if batch_feature:
                 image['input_features'] = arr

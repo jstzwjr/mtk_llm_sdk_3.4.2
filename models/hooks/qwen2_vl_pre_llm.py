@@ -261,4 +261,22 @@ class Qwen2VLPreLLM(BaseHook):
 
         kwargs.update({'qwen2_vl_position_ids': qwen2_vl_position_ids, 'qwen2_vl_mrope_delta': qwen2_vl_mrope_delta})
 
+        # NEW: deepstack — compute visual_pos_masks for image-token positions
+        # LLM ModelChunk uses this mask to add deepstack embeds at image positions in early decoder layers.
+        tt = torch.as_tensor(text_tokens) if not isinstance(text_tokens, torch.Tensor) else text_tokens
+        image_token_id = self.config.image_token_id
+        visual_pos_masks = (tt == image_token_id)
+        # Optionally pad with overture region as non-visual (False) to align with input embeddings.
+        if overture_size > 0:
+            pad_shape = list(visual_pos_masks.shape)
+            pad_shape[-1] = overture_size
+            pad = torch.zeros(pad_shape, dtype=torch.bool, device=visual_pos_masks.device)
+            visual_pos_masks = torch.cat([pad, visual_pos_masks], dim=-1)
+        kwargs['visual_pos_masks'] = visual_pos_masks
+        kwargs['visual_pos_overture_size'] = overture_size
+        logger.debug(
+            f'[deepstack] visual_pos_masks shape={tuple(visual_pos_masks.shape)} '
+            f'num_visual_positions={int(visual_pos_masks.sum().item())}'
+        )
+
         return input_embeds, kwargs

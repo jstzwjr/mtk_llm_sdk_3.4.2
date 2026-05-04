@@ -60,17 +60,17 @@ class Qwen2_5VLGetEmbeds(Qwen2VLGetEmbeds):  # noqa: N801
             logger.error('multimodal_embeds should not be None for qwen2.5-vl get_embeds hook.')
 
         # Different from models.get_embeds.qwen2_vl.Qwen2VLGetEmbeds
-        # Argsort the encoder output
+        # Argsort the encoder output (skip if no window attention, e.g. Qwen3-VL)
         window_index = kwargs.get('qwen2_5vl_vision_window_index')
-        if window_index is None:
-            logger.error(
-                'qwen2_5vl_vision_window_index must be passed when forwarding Qwen2_5VLGetEmbeds', err=ValueError
-            )
-        reverse_indices = torch.argsort(window_index)
-        logger.debug(f'reverse_indices: {reverse_indices}')
+        if window_index is not None:
+            reverse_indices = torch.argsort(window_index)
+            logger.debug(f'reverse_indices: {reverse_indices}')
+        else:
+            reverse_indices = None
         for i in range(len(multimodal_embeds)):
             logger.debug(f'{i} - {multimodal_embeds[i].shape}')
-            multimodal_embeds[i] = multimodal_embeds[i][reverse_indices, :]
+            if reverse_indices is not None:
+                multimodal_embeds[i] = multimodal_embeds[i][reverse_indices, :]
             logger.debug(f'{i} - {multimodal_embeds[i].shape}')
 
         return super().forward(

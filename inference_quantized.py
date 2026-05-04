@@ -200,7 +200,7 @@ def args_sanity_checks(args):
         encoder_model_paths = [
             os.path.join(quantized_model_folders['encoder'], x)
             for x in os.listdir(quantized_model_folders['encoder'])
-            if not x.endswith('.json')
+            if x.endswith(('.tflite', '.mlir'))
         ]
         for model_path in encoder_model_paths:
             quantized_model_infos['encoder'].append(

@@ -820,6 +820,25 @@ class FloatPipeline(BasePipeline):
         internvl_navit_rope_vision_rot_emb = kwargs.get('internvl_navit_rope_rotary_pos_emb')
         internvl_navit_rope_cu_seqlens = kwargs.get('internvl_navit_rope_cu_seqlens')
 
+        # For Qwen3-VL: set precomputed positional embeddings and attention mask on encoder chunk 0.
+        # During float inference, _precomputed_pos_embed is never set (only set in get_jit_trace_inputs),
+        # so the fallback arange(seq_len) would use wrong sequential indices instead of 2D spatial positions.
+        qwen3vl_image_grid_thw = kwargs.get('image_grid_thw')
+        if qwen3vl_image_grid_thw is not None and len(self.encoder) > 0:
+            enc0 = self.encoder[0]
+            if hasattr(enc0, '_fast_pos_embed_interpolate'):
+                if isinstance(qwen3vl_image_grid_thw, np.ndarray):
+                    qwen3vl_image_grid_thw = torch.from_numpy(qwen3vl_image_grid_thw)
+                enc0._precomputed_pos_embed = enc0._fast_pos_embed_interpolate(qwen3vl_image_grid_thw).detach()
+                if qwen_attn_mask is not None:
+                    for enc in self.encoder:
+                        enc._vision_attention_mask = qwen_attn_mask
+                # NEW: also propagate vision rotary embedding (freqs) to every encoder chunk
+                # so each Qwen3VL block can apply RoPE per-layer (HF-aligned).
+                if qwen_vision_rot_emb is not None:
+                    for enc in self.encoder:
+                        enc._vision_rot_emb = qwen_vision_rot_emb
+
         outputs = []
         cross_attns = []
         hidden_states = inputs[0]
@@ -871,6 +890,19 @@ class FloatPipeline(BasePipeline):
 
             hidden_states = self.encoder[i](hidden_states, *extra_inputs)
         out = hidden_states
+
+        # NEW: deepstack — aggregate intermediates captured by each encoder chunk
+        deepstack_raw_intermediates = []
+        for enc in self.encoder:
+            chunk_caps = getattr(enc, '_last_deepstack_intermediates', None)
+            if chunk_caps:
+                deepstack_raw_intermediates.extend(chunk_caps)
+        if deepstack_raw_intermediates:
+            kwargs['_deepstack_raw_intermediates'] = deepstack_raw_intermediates
+            logger.debug(
+                f'[deepstack] encoder captured {len(deepstack_raw_intermediates)} intermediate(s); '
+                f'first shape={tuple(deepstack_raw_intermediates[0].shape)}'
+            )
 
         if isinstance(out, tuple):
             if len(out) != 2:
@@ -925,7 +957,38 @@ class FloatPipeline(BasePipeline):
                 ),
                 **save_dict,
             )
-        return self.projector(inputs), kwargs
+
+        # Run main merger
+        main_out = self.projector(inputs)
+
+        # NEW: deepstack — apply postshuffle mergers on the captured intermediates
+        raw_inters = kwargs.pop('_deepstack_raw_intermediates', None)
+        if raw_inters and hasattr(self.projector, 'deepstack_merger_list') and len(self.projector.deepstack_merger_list) > 0:
+            ds_embeds = []
+            hidden_size = self.projector.hidden_size  # embed_dim * spatial_merge_size**2 = 1024 * 4 = 4096
+            for i, raw in enumerate(raw_inters):
+                if i >= len(self.projector.deepstack_merger_list):
+                    logger.warning(
+                        f'[deepstack] more captures ({len(raw_inters)}) than mergers '
+                        f'({len(self.projector.deepstack_merger_list)}); ignoring extras.'
+                    )
+                    break
+                m = self.projector.deepstack_merger_list[i]
+                target_device = next(m.parameters()).device
+                target_dtype = next(m.parameters()).dtype
+                x = raw.to(device=target_device, dtype=target_dtype)
+                # postshuffle: reshape FIRST then norm (use_postshuffle_norm=True in HF)
+                x = x.view(-1, hidden_size)
+                x = m['norm'](x)
+                x = m['linear_fc2'](m['act'](m['linear_fc1'](x)))
+                ds_embeds.append(x)
+            kwargs['deepstack_visual_embeds'] = ds_embeds
+            self._deepstack_consumed = 0  # reset per-prompt cursor
+            logger.debug(
+                f'[deepstack] projector produced {len(ds_embeds)} ds_embeds; '
+                f'first shape={tuple(ds_embeds[0].shape)} dtype={ds_embeds[0].dtype}'
+            )
+        return main_out, kwargs
 
     @torch.no_grad()
     def forward_llm_float(
@@ -1185,6 +1248,50 @@ class FloatPipeline(BasePipeline):
                 *self.lora_handler.llm_lora_inputs[i],
             )
             hidden_states = model_out[0]
+
+            # NEW: deepstack — at first N decoder layers (N = len(deepstack_visual_embeds)),
+            # add ds_embeds[i] at image-token positions in the current prefill batch.
+            _ds_embeds = kwargs.get('deepstack_visual_embeds')
+            if _ds_embeds is not None and i < len(_ds_embeds):
+                _img_tok_id = getattr(self.config.l, 'image_token_id', None) or (self.config.l.kwargs.get('image_token_id') if hasattr(self.config.l, 'kwargs') and isinstance(self.config.l.kwargs, dict) else None)
+                if _img_tok_id is None:
+                    _img_tok_id = getattr(self.config.l.kwargs, 'image_token_id', None) if hasattr(self.config.l, 'kwargs') else None
+                if _img_tok_id is not None and curr_tokens is not None:
+                    _ct = torch.as_tensor(curr_tokens) if not isinstance(curr_tokens, torch.Tensor) else curr_tokens
+                    _batch_mask = (_ct == _img_tok_id)
+                    _n_in_batch = int(_batch_mask.sum().item())
+                    if _n_in_batch > 0:
+                        _consumed = getattr(self, '_deepstack_consumed', 0)
+                        _ds_full = _ds_embeds[i]
+                        _slice = _ds_full[_consumed:_consumed + _n_in_batch]
+                        if _slice.shape[0] != _n_in_batch:
+                            logger.warning(
+                                f'[deepstack] layer {i}: slice shape {_slice.shape} != n_in_batch {_n_in_batch}; '
+                                f'consumed={_consumed} ds_full_len={_ds_full.shape[0]}'
+                            )
+                        _slice = _slice.to(device=hidden_states.device, dtype=hidden_states.dtype)
+                        # Align mask to hidden_states' actual padded shape.
+                        # MTK left-pads the first prompt batch to num_token, so curr_tokens
+                        # may be SHORTER than hidden_states.shape[1]; pad mask with leading False.
+                        _bm = _batch_mask.to(hidden_states.device)
+                        if _bm.dim() == 1:
+                            _bm = _bm.unsqueeze(0)
+                        _T_full = hidden_states.shape[1]
+                        _T_real = _bm.shape[-1]
+                        if _T_real < _T_full:
+                            _pad = torch.zeros(_bm.shape[0], _T_full - _T_real, dtype=torch.bool, device=_bm.device)
+                            _bm = torch.cat([_pad, _bm], dim=-1)
+                        elif _T_real > _T_full:
+                            _bm = _bm[:, -_T_full:]
+                        hidden_states = hidden_states.clone()
+                        hidden_states[_bm] = hidden_states[_bm] + _slice
+                        if i == len(_ds_embeds) - 1:
+                            # advance cursor only after last deepstack-receiving layer of this batch
+                            self._deepstack_consumed = _consumed + _n_in_batch
+                            logger.debug(
+                                f'[deepstack] batch advanced cursor: {_consumed} -> {_consumed + _n_in_batch}'
+                            )
+
             k_cache = model_out[1]
             v_cache = model_out[2]
             if pad_len > 0:
@@ -2162,7 +2269,9 @@ class QuantizedPipeline(BasePipeline):
             return
 
         enc_quantized_model_paths = [
-            os.path.join(encoder_folder, x) for x in os.listdir(encoder_folder) if not x.endswith('.json')
+            os.path.join(encoder_folder, x)
+            for x in os.listdir(encoder_folder)
+            if x.endswith(('.tflite', '.mlir'))
         ]
         for enc_quantized_model_path in enc_quantized_model_paths:
             self.encoder_quantized_model_infos.append(

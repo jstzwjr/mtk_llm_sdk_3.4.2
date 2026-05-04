@@ -1264,6 +1264,9 @@ def get_normalized_config(config_dict, module, return_class=False, verbose=True)
         elif model_type == 'intern_vit_6b_navit_rope':
             import_path = 'mtk_llm_sdk.models.encoders.configuration_internvl_navit_rope'
             class_name = 'InternViTNavitRopeConfig'
+        elif model_type == 'qwen3_vl_vision':
+            import_path = 'mtk_llm_sdk.models.encoders.configuration_qwen3vl_vision'
+            class_name = 'Qwen3VLVisionConfig'
         elif model_type == 'qwen2_5_vl_vision':
             import_path = 'mtk_llm_sdk.models.encoders.configuration_qwen2_5vl_vision'
             class_name = 'Qwen2_5VLVisionConfig'
@@ -1285,7 +1288,7 @@ def get_normalized_config(config_dict, module, return_class=False, verbose=True)
         elif model_type == 'internvl2':
             import_path = 'mtk_llm_sdk.models.projectors.configuration_projector_internvl2'
             class_name = 'InternVL2ProjectorConfig'
-        elif model_type in ['qwen2_vl', 'patch_merger', 'qwen2_5_vl']:
+        elif model_type in ['qwen2_vl', 'patch_merger', 'qwen2_5_vl', 'qwen3_vl']:
             import_path = 'mtk_llm_sdk.models.projectors.configuration_patchmerger'
             class_name = 'PatchMergerProjectorConfig'
         elif model_type == 'phi3v':
@@ -1901,6 +1904,9 @@ def resolve_encoder_class(config):
     elif config.model_type == 'intern_vit_6b_navit_rope':
         import_path = 'mtk_llm_sdk.models.encoders.modeling_internvl_navit_rope'
         encoder_class_name = 'InternVLNavitRopeModel'
+    elif config.model_type == 'qwen3_vl_vision':
+        import_path = 'mtk_llm_sdk.models.encoders.modeling_qwen3vl_vision'
+        encoder_class_name = 'Qwen3VLVisionModel'
     elif config.model_type == 'qwen2_5_vl_vision':
         import_path = 'mtk_llm_sdk.models.encoders.modeling_qwen2_5vl_vision'
         encoder_class_name = 'Qwen2_5VLVisionModel'
@@ -1955,6 +1961,9 @@ def resolve_projector_class(config):
     elif config.model_type == 'andesvl':
         import_path = 'mtk_llm_sdk.models.projectors.projector_andesvl'
         projector_class_name = 'InternVLNavitRopeProjector'
+    elif config.model_type == 'qwen3_vl':
+        import_path = 'mtk_llm_sdk.models.projectors.projector_qwen3_vl_patchmerger'
+        projector_class_name = 'Qwen3VLPatchMerger'
     elif config.model_type == 'qwen2_5_vl':
         import_path = 'mtk_llm_sdk.models.projectors.projector_qwen2_5_vl_patchmerger'
         projector_class_name = 'Qwen2_5VLPatchMergerProjector'

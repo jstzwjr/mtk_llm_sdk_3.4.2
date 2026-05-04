@@ -72,7 +72,7 @@ class Qwen2VLGetEmbeds(BaseGetEmbedsHook):
             image_embeds = torch.from_numpy(image_embeds).to(
                 device=self.text_embedding_layer.weight.device, dtype=text_embeds.dtype
             )
-        text_embeds[selected] = image_embeds.reshape(-1, c)
+        text_embeds[selected] = image_embeds.reshape(-1, c).to(dtype=text_embeds.dtype)
         text_embeds = text_embeds.reshape(b, n, c)
         kwargs.update({'text_tokens': text_tokens})
 

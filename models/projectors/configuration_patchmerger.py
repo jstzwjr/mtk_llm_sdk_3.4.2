@@ -32,7 +32,7 @@ class PatchMergerProjectorConfig(BaseProjectorConfig):
         """
         super().__init__(**kwargs)
         self.model_type = self.kwargs.pop('model_type', 'qwen2_vl')
-        if self.model_type not in ['qwen2_vl', 'patch_merger', 'qwen2_5_vl']:
+        if self.model_type not in ['qwen2_vl', 'patch_merger', 'qwen2_5_vl', 'qwen3_vl']:
             logger.error(
                 f'Expected model_type to be qwen2_vl or patch_merger but got {self.model_type} instead',
                 err=RuntimeError,
@@ -52,6 +52,7 @@ class PatchMergerProjectorConfig(BaseProjectorConfig):
         self.image_resolution = self.kwargs.pop('image_resolution', None)
         self.preprocessor_config = self.kwargs.pop('preprocessor_config', None)
         self.num_heads = self.kwargs.pop('num_heads', 16)
+        self.deepstack_visual_indexes = self.kwargs.pop('deepstack_visual_indexes', [])
 
         if self.kwargs.pop('verbose', True):
             self.print_config()

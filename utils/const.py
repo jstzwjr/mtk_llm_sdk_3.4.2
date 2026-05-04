@@ -39,6 +39,7 @@ SUPPORTED_ENCODERS = [
     'phi4o_navit_siglip',
     'intern_vit_6b_navit_rope',
     'qwen2_5_vl_vision',
+    'qwen3_vl_vision',
     'qwen2_audio_encoder',
 ]
 SUPPORTED_PROJECTORS = [
@@ -52,6 +53,7 @@ SUPPORTED_PROJECTORS = [
     'phi4o',
     'andesvl',
     'qwen2_5_vl',
+    'qwen3_vl',
     'qwen2_audio_encoder',
     'minicpmv',
 ]
@@ -230,6 +232,7 @@ SUPPORTED_GETEMBEDS = [
     'gecko2',
     'andesvl',
     'qwen2_5_vl',
+    'qwen3_vl',
     'text_with_mm',
     'minicpmv',
 ]
