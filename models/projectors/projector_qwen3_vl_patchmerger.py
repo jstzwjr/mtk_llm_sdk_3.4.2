@@ -110,12 +110,32 @@ class Qwen3VLPatchMerger(BaseProjector):
 
         return self, state_dict
 
-    def forward(self, x):
-        """Main merger forward: norm -> reshape -> fc1 -> gelu -> fc2."""
-        x = self.norm(x)
-        x = x.view(-1, self.hidden_size)
-        x = self.linear_fc2(self.act(self.linear_fc1(x)))
-        return x
+    def forward(self, x, *deepstack_intermediates):
+        """Main merger + (optional) deepstack mergers, all PTQ-traceable.
+
+        Main path: norm -> reshape -> fc1 -> gelu -> fc2
+        Deepstack path (postshuffle): reshape -> norm -> fc1 -> gelu -> fc2
+
+        Returns:
+            torch.Tensor                 — 仅主分支（没传 deepstack 时）
+            tuple(main, ds_0, ds_1, ...) — 传了 deepstack 时（PTQ trace 走这条）
+        """
+        # Main merger
+        m_x = self.norm(x)
+        m_x = m_x.view(-1, self.hidden_size)
+        m_x = self.linear_fc2(self.act(self.linear_fc1(m_x)))
+        if not deepstack_intermediates:
+            return m_x
+
+        # Deepstack mergers (postshuffle: reshape FIRST, then norm)
+        ds_outs = []
+        for i, raw in enumerate(deepstack_intermediates):
+            m = self.deepstack_merger_list[i]
+            d = raw.view(-1, self.hidden_size)
+            d = m['norm'](d)
+            d = m['linear_fc2'](m['act'](m['linear_fc1'](d)))
+            ds_outs.append(d)
+        return (m_x, *ds_outs)
 
     def _calculate_ptq_fixed_shape_batch(self):
         from ..preprocessors.configuration_qwen2vl_vision import Qwen2VLPreprocessorConfig
@@ -135,7 +155,15 @@ class Qwen3VLPatchMerger(BaseProjector):
     def get_jit_trace_inputs(self):
         self._calculate_ptq_fixed_shape_batch()
         fixed_batch_size = int((self.image_grid_thw[0][1] * self.image_grid_thw[0][2]).item())
-        return torch.randn(fixed_batch_size, self.config.embed_dim, device='cpu', dtype=torch.float32)
+        # NEW (Patch C): 主输入 + 每个 deepstack tap 一个相同形状的 dummy 输入
+        main_x = torch.randn(fixed_batch_size, self.config.embed_dim, device='cpu', dtype=torch.float32)
+        if self._num_deepstack <= 0:
+            return main_x
+        ds_inputs = tuple(
+            torch.randn(fixed_batch_size, self.config.embed_dim, device='cpu', dtype=torch.float32)
+            for _ in range(self._num_deepstack)
+        )
+        return (main_x, *ds_inputs)
 
     def get_ptq_inputs(self, args=None, **kwargs):
         import numpy as np
@@ -143,8 +171,10 @@ class Qwen3VLPatchMerger(BaseProjector):
             self._calculate_ptq_fixed_shape_batch()
         fixed_batch_size = int((self.image_grid_thw[0][1] * self.image_grid_thw[0][2]).item())
         embed_dim = self.config.embed_dim
-        input_shapes = [[fixed_batch_size, embed_dim]]
-        input_value_ranges = [None]
+        # NEW (Patch C): 主输入 shape + 每个 deepstack tap 一个同形 shape
+        n_extra = max(0, self._num_deepstack)
+        input_shapes = [[fixed_batch_size, embed_dim]] * (1 + n_extra)
+        input_value_ranges = [None] * (1 + n_extra)
 
         if args is not None and hasattr(args, 'calibration_dataset') and args.calibration_dataset != 'fake':
             import os as _os
@@ -160,11 +190,22 @@ class Qwen3VLPatchMerger(BaseProjector):
                     proj_dir = _os.path.join(enc_dir, f'chunk_{max(chunks)}')
                 for f in _utils.get_sorted_path_list(proj_dir, '.npz', sep='-'):
                     data = np.load(f)
-                    yield [data['hidden_states'].astype(np.float32)]
+                    main = data['hidden_states'].astype(np.float32)
+                    # NEW (Patch C): 校准 npz 若含 deepstack_<i>，按序加载；否则用主输入复制占位
+                    extras = []
+                    for j in range(n_extra):
+                        key = f'deepstack_{j}'
+                        if key in data.files:
+                            extras.append(data[key].astype(np.float32))
+                        else:
+                            extras.append(main.copy())  # fallback：暂用 main 复制（PTQ-correct 需用真实 ds 校准 npz）
+                    yield [main, *extras]
         else:
             def calib_data_gen():
                 for _ in range(10):
-                    yield [np.random.rand(fixed_batch_size, embed_dim).astype(np.float32)]
+                    main = np.random.rand(fixed_batch_size, embed_dim).astype(np.float32)
+                    extras = [np.random.rand(fixed_batch_size, embed_dim).astype(np.float32) for _ in range(n_extra)]
+                    yield [main, *extras]
 
         def eval_data_gen():
             return calib_data_gen()

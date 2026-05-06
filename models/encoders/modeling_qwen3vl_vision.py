@@ -523,11 +523,17 @@ class Qwen3VLVisionModel(BaseVisionEncoderChunk):
             # Capture this layer's output if it is a deepstack tap point
             global_idx = self.first_layer_idx + idx
             if global_idx in deepstack_indexes:
-                captured_deepstack.append(hidden_states)
+                # NEW (Patch A2): .clone() 让 jit_trace 给每个返回张量独立 op 名，避免 Duplicated output names
+                captured_deepstack.append(hidden_states.clone())
 
         # Side-channel: pipeline.forward_encoder reads this attribute to aggregate across chunks
+        # (kept for backward-compat with pipeline path that does NOT consume tuple return)
         self._last_deepstack_intermediates = captured_deepstack
 
+        # NEW (Patch A1): if any deepstack intermediates captured, return them as part of tuple,
+        # so jit_trace exposes them as graph outputs (PTQ-traceable, can flow into DLA out_ports).
+        if captured_deepstack:
+            return (hidden_states.clone(), *captured_deepstack)
         return hidden_states
 
     def get_jit_trace_inputs(self):

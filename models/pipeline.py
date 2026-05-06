@@ -70,6 +70,11 @@ class FloatPipeline(BasePipeline):
         self.encoder_chunk_class = utils.resolve_encoder_class(self.config.e)
         self.projector_class = utils.resolve_projector_class(self.config.p2)
         self.llm_chunk_class = utils.resolve_llm_class(self.config.l)
+
+        # NEW (Patch E): bridge vision deepstack count -> LLM config so Qwen3ModelChunk knows
+        # which chunks (LLM layer < N) accept ds_padded extra input.
+        _ds_indexes = getattr(self.config.e, 'deepstack_visual_indexes', None) if self.config.e is not None else None
+        self.config.l._num_deepstack_inject = len(_ds_indexes) if _ds_indexes else 0
         self.config.t, self.llm_tail_class, self.llm_tail_decoder_class = utils.resolve_tail_class(
             self.config.t, self.config.l
         )
@@ -888,7 +893,10 @@ class FloatPipeline(BasePipeline):
                 extra_inputs.append(inputs[1])
             extra_inputs.extend(self.lora_handler.encoder_lora_inputs[i])
 
-            hidden_states = self.encoder[i](hidden_states, *extra_inputs)
+            # NEW (Patch A): encoder chunk 在 deepstack tap 点会返回 tuple(hs, ds_tensor[, ...]) 给 jit_trace；
+            # eager 路径下 deepstack 仍走 _last_deepstack_intermediates side-channel，这里只取 hs[0] 串到下一层。
+            _enc_out = self.encoder[i](hidden_states, *extra_inputs)
+            hidden_states = _enc_out[0] if isinstance(_enc_out, tuple) else _enc_out
         out = hidden_states
 
         # NEW: deepstack — aggregate intermediates captured by each encoder chunk
@@ -944,12 +952,26 @@ class FloatPipeline(BasePipeline):
         if hasattr(self.projector, 'inner_projector_hook'):
             self.projector.inner_projector_hook(inputs, kwargs)
 
+        # NEW (Patch C): 准备 deepstack 输入（设备/dtype 对齐到 projector 主输入）
+        raw_inters = kwargs.pop('_deepstack_raw_intermediates', None) or ()
+        if raw_inters:
+            try:
+                _proj_param = next(self.projector.parameters())
+                _t_dev, _t_dtype = _proj_param.device, _proj_param.dtype
+            except StopIteration:
+                _t_dev, _t_dtype = inputs.device, inputs.dtype
+            raw_inters = tuple(r.to(device=_t_dev, dtype=_t_dtype) for r in raw_inters)
+            inputs = inputs.to(device=_t_dev, dtype=_t_dtype)
+
         save_chunk = self.backend == const.CONVERTER
         if self.task == 'make_calibration' and save_chunk:
             logger.debug('Save projector calibration batch')
             output_dir = None if self.task != 'make_calibration' else kwargs.get('output_dirs')['encoder'][-1]
 
             save_dict = {'hidden_states': inputs.cpu().numpy().astype(np.float32)}
+            # NEW (Patch C): 校准 npz 把 deepstack 输入也存进来，键名与 projector.get_ptq_inputs 读取约定一致
+            for _j, _r in enumerate(raw_inters):
+                save_dict[f'deepstack_{_j}'] = _r.cpu().numpy().astype(np.float32)
             np.savez(
                 os.path.join(
                     output_dir,
@@ -958,36 +980,20 @@ class FloatPipeline(BasePipeline):
                 **save_dict,
             )
 
-        # Run main merger
-        main_out = self.projector(inputs)
-
-        # NEW: deepstack — apply postshuffle mergers on the captured intermediates
-        raw_inters = kwargs.pop('_deepstack_raw_intermediates', None)
-        if raw_inters and hasattr(self.projector, 'deepstack_merger_list') and len(self.projector.deepstack_merger_list) > 0:
-            ds_embeds = []
-            hidden_size = self.projector.hidden_size  # embed_dim * spatial_merge_size**2 = 1024 * 4 = 4096
-            for i, raw in enumerate(raw_inters):
-                if i >= len(self.projector.deepstack_merger_list):
-                    logger.warning(
-                        f'[deepstack] more captures ({len(raw_inters)}) than mergers '
-                        f'({len(self.projector.deepstack_merger_list)}); ignoring extras.'
-                    )
-                    break
-                m = self.projector.deepstack_merger_list[i]
-                target_device = next(m.parameters()).device
-                target_dtype = next(m.parameters()).dtype
-                x = raw.to(device=target_device, dtype=target_dtype)
-                # postshuffle: reshape FIRST then norm (use_postshuffle_norm=True in HF)
-                x = x.view(-1, hidden_size)
-                x = m['norm'](x)
-                x = m['linear_fc2'](m['act'](m['linear_fc1'](x)))
-                ds_embeds.append(x)
-            kwargs['deepstack_visual_embeds'] = ds_embeds
-            self._deepstack_consumed = 0  # reset per-prompt cursor
-            logger.debug(
-                f'[deepstack] projector produced {len(ds_embeds)} ds_embeds; '
-                f'first shape={tuple(ds_embeds[0].shape)} dtype={ds_embeds[0].dtype}'
-            )
+        # NEW (Patch C): projector forward 现在自带 deepstack mergers，pipeline 不再做 Python 编排
+        proj_out = self.projector(inputs, *raw_inters)
+        if isinstance(proj_out, tuple):
+            main_out = proj_out[0]
+            ds_embeds = list(proj_out[1:])
+            if ds_embeds:
+                kwargs['deepstack_visual_embeds'] = ds_embeds
+                self._deepstack_consumed = 0  # reset per-prompt cursor
+                logger.debug(
+                    f'[deepstack] projector produced {len(ds_embeds)} ds_embeds; '
+                    f'first shape={tuple(ds_embeds[0].shape)} dtype={ds_embeds[0].dtype}'
+                )
+        else:
+            main_out = proj_out
         return main_out, kwargs
 
     @torch.no_grad()
@@ -1237,25 +1243,15 @@ class FloatPipeline(BasePipeline):
                 if len(lora_mapping_files) > 0:
                     lora_mapping_files[i].write(self.lora_handler.lora_config_paths[0] + '\n')
 
-            logger.debug(f'Forward LLM (chunk {i})')
-            model_out = self.llm[i](
-                hidden_states,
-                mask,
-                *pos_emb,
-                *cache_in,
-                *cross_attn,
-                *other_masks,
-                *self.lora_handler.llm_lora_inputs[i],
-            )
-            hidden_states = model_out[0]
-
-            # NEW: deepstack — at first N decoder layers (N = len(deepstack_visual_embeds)),
-            # add ds_embeds[i] at image-token positions in the current prefill batch.
+            # NEW (Patch E): pre-scatter deepstack embed -> ds_padded [1, T, D] (零初始 + image 位置填值)
+            # 然后把 ds_padded 作为额外位置参数传入 chunk forward；chunk 内只做 hidden + ds_padded（DLA-friendly）。
+            _extra_chunk_inputs = []
             _ds_embeds = kwargs.get('deepstack_visual_embeds')
             if _ds_embeds is not None and i < len(_ds_embeds):
                 _img_tok_id = getattr(self.config.l, 'image_token_id', None) or (self.config.l.kwargs.get('image_token_id') if hasattr(self.config.l, 'kwargs') and isinstance(self.config.l.kwargs, dict) else None)
                 if _img_tok_id is None:
                     _img_tok_id = getattr(self.config.l.kwargs, 'image_token_id', None) if hasattr(self.config.l, 'kwargs') else None
+                ds_padded = torch.zeros_like(hidden_states)
                 if _img_tok_id is not None and curr_tokens is not None:
                     _ct = torch.as_tensor(curr_tokens) if not isinstance(curr_tokens, torch.Tensor) else curr_tokens
                     _batch_mask = (_ct == _img_tok_id)
@@ -1269,28 +1265,37 @@ class FloatPipeline(BasePipeline):
                                 f'[deepstack] layer {i}: slice shape {_slice.shape} != n_in_batch {_n_in_batch}; '
                                 f'consumed={_consumed} ds_full_len={_ds_full.shape[0]}'
                             )
-                        _slice = _slice.to(device=hidden_states.device, dtype=hidden_states.dtype)
-                        # Align mask to hidden_states' actual padded shape.
-                        # MTK left-pads the first prompt batch to num_token, so curr_tokens
-                        # may be SHORTER than hidden_states.shape[1]; pad mask with leading False.
-                        _bm = _batch_mask.to(hidden_states.device)
+                        _slice = _slice.to(device=ds_padded.device, dtype=ds_padded.dtype)
+                        _bm = _batch_mask.to(ds_padded.device)
                         if _bm.dim() == 1:
                             _bm = _bm.unsqueeze(0)
-                        _T_full = hidden_states.shape[1]
+                        _T_full = ds_padded.shape[1]
                         _T_real = _bm.shape[-1]
                         if _T_real < _T_full:
                             _pad = torch.zeros(_bm.shape[0], _T_full - _T_real, dtype=torch.bool, device=_bm.device)
                             _bm = torch.cat([_pad, _bm], dim=-1)
                         elif _T_real > _T_full:
                             _bm = _bm[:, -_T_full:]
-                        hidden_states = hidden_states.clone()
-                        hidden_states[_bm] = hidden_states[_bm] + _slice
+                        ds_padded[_bm] = _slice
                         if i == len(_ds_embeds) - 1:
-                            # advance cursor only after last deepstack-receiving layer of this batch
                             self._deepstack_consumed = _consumed + _n_in_batch
                             logger.debug(
                                 f'[deepstack] batch advanced cursor: {_consumed} -> {_consumed + _n_in_batch}'
                             )
+                _extra_chunk_inputs.append(ds_padded)
+
+            logger.debug(f'Forward LLM (chunk {i})')
+            model_out = self.llm[i](
+                hidden_states,
+                mask,
+                *pos_emb,
+                *cache_in,
+                *cross_attn,
+                *other_masks,
+                *self.lora_handler.llm_lora_inputs[i],
+                *_extra_chunk_inputs,
+            )
+            hidden_states = model_out[0]
 
             k_cache = model_out[1]
             v_cache = model_out[2]
@@ -2186,6 +2191,10 @@ class QuantizedPipeline(BasePipeline):
         self.preprocessor_class = utils.resolve_preprocessor_class(self.config.p)
         self.encoder_chunk_class = utils.resolve_encoder_class(self.config.e)
         self.llm_chunk_class = utils.resolve_llm_class(self.config.l)
+
+        # NEW (Patch E): same bridge as FloatPipeline
+        _ds_indexes = getattr(self.config.e, 'deepstack_visual_indexes', None) if self.config.e is not None else None
+        self.config.l._num_deepstack_inject = len(_ds_indexes) if _ds_indexes else 0
 
         self.ee_index = self.config.l.early_exit_index
         self.is_ee = self.ee_index is not None

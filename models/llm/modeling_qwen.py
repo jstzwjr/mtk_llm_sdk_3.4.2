@@ -1249,14 +1249,76 @@ class Qwen2ModelChunk(ModelChunk):
 
 
 class Qwen3ModelChunk(ModelChunk):
-    """Qwen3ModelChunk class for the Qwen3 model."""
+    """Qwen3ModelChunk class for the Qwen3 model.
+
+    Patch E: deepstack 注入。pipeline 通过 config._num_deepstack_inject 告知本次 run
+    需在 LLM layer [0, N) 注入 deepstack visual embed。本类的 chunk 若覆盖了这些层，
+    forward 多接受 1 个 ds_padded 输入（[1, T, D]，已由 pipeline 端 scatter 完成），
+    内部仅做 hidden = hidden + ds_padded（DLA-friendly mul+add）。
+    """
 
     def __init__(self, config: QwenConfig, lora, **kwargs):
         """Initializes the Qwen3ModelChunk class.
 
         Args:
-            config: A QwenConfig object.
+            config: A QwenConfig object. May carry attribute `_num_deepstack_inject` (int).
             lora (LoRA): LoRA object.
             kwargs: All keyword arguments.
         """
         super().__init__(config, lora, decoder_class=Qwen3DecoderLayer, **kwargs)
+        num_ds_inject = int(getattr(config, '_num_deepstack_inject', 0) or 0)
+        # 当前每个 chunk 对应 1 层，first_layer_idx 即 LLM 层号
+        self._inject_ds = (num_ds_inject > 0) and (self.first_layer_idx < num_ds_inject)
+        # 注：不修改 base.expected_num_inputs；forward 在 super 前 strip ds_padded
+
+    def forward(self, *inputs):
+        if not self._inject_ds:
+            return super().forward(*inputs)
+        ds_padded = inputs[-1]
+        base_inputs = inputs[:-1]
+        outputs = super().forward(*base_inputs)
+        if isinstance(outputs, tuple):
+            hidden_states = outputs[0]
+            rest = outputs[1:]
+        else:
+            hidden_states = outputs
+            rest = ()
+        # DLA-friendly：直接 add（pipeline 已把 ds_padded scatter 成同 shape，非 image 位置为 0）
+        ds_padded = ds_padded.to(device=hidden_states.device, dtype=hidden_states.dtype)
+        hidden_states = hidden_states + ds_padded
+        return (hidden_states, *rest)
+
+    def get_jit_trace_inputs(self):
+        base = super().get_jit_trace_inputs()
+        if not self._inject_ds:
+            return base
+        # ds_padded 与 input_embeds 同 shape (1, T, hidden_size)
+        if isinstance(base, tuple):
+            ds_input = torch.zeros_like(base[0])
+            return (*base, ds_input)
+        ds_input = torch.zeros_like(base)
+        return (base, ds_input)
+
+    def get_ptq_inputs(self, *args, **kwargs):
+        result = super().get_ptq_inputs(*args, **kwargs)
+        if not self._inject_ds:
+            return result
+        input_shapes, input_value_ranges, calib_data_gen, eval_data_gen = result
+        # ds_padded shape == input_embeds shape
+        ds_shape = list(input_shapes[0])
+        new_input_shapes = list(input_shapes) + [ds_shape]
+        new_input_value_ranges = list(input_value_ranges) + [None]
+
+        def _wrap_gen(orig_gen, ds_shape):
+            def _new():
+                for batch in orig_gen():
+                    ds = np.zeros(ds_shape, dtype=np.float32)
+                    yield [*batch, ds]
+            return _new
+
+        return (
+            new_input_shapes,
+            new_input_value_ranges,
+            _wrap_gen(calib_data_gen, ds_shape),
+            _wrap_gen(eval_data_gen, ds_shape),
+        )
