@@ -886,6 +886,9 @@ def shape_fix_encoder(
     lora_inp_shapes = []
     lora_inp_names = []
     extra_inp_names = set()
+    # Patch F: 跨 chunk 累积"暴露成 final model output 的 secondary outputs"
+    final_extra_output_names = []
+    deepstack_chunk_indices = []   # 记录哪些 encoder chunk 贡献了 secondary（projector 引用其名字）
     pbar = tqdm(total=len(encoder_model_list))
     for i, f in enumerate(encoder_model_list):
         subgraph, model = quantized_model_utils.get_subgraph_from_quantized_model(f, return_nrpmodel=True)
@@ -930,12 +933,25 @@ def shape_fix_encoder(
                 )
 
         num_non_lora_inputs = quantized_model_info['num_non_lora_inputs']
+        is_projector_chunk = quantized_model_info.get('projector', False)
         # rename all non-lora inputs
         input_name_remap = OrderedDict()
         input_name_remap[subgraph.inputs[0]] = 'encoder_input'
         if num_non_lora_inputs > 1:
-            input_name_remap[subgraph.inputs[1]] = 'audio_attn_mask'
-            extra_inp_names.add('audio_attn_mask')
+            if is_projector_chunk:
+                # Patch F: projector 多输入对接前面 encoder chunks 的 secondary outputs。
+                # 用与 encoder chunk 输出相同的命名（extra_output_chunkN_idxK），
+                # builder 通过 name match 自动 wire 起来。
+                for _k_in in range(1, num_non_lora_inputs):
+                    if _k_in - 1 < len(deepstack_chunk_indices):
+                        _src_chunk = deepstack_chunk_indices[_k_in - 1]
+                        input_name_remap[subgraph.inputs[_k_in]] = f'extra_output_chunk{_src_chunk}_idx1'
+                    else:
+                        # 兜底：deepstack 数与 projector input 数对不上时，给唯一名字避免冲突
+                        input_name_remap[subgraph.inputs[_k_in]] = f'projector_extra_input_{_k_in}'
+            else:
+                input_name_remap[subgraph.inputs[1]] = 'audio_attn_mask'
+                extra_inp_names.add('audio_attn_mask')
 
         # rename all lora inputs
         for j in range(quantized_model_info['num_lora_inputs']):
@@ -967,9 +983,14 @@ def shape_fix_encoder(
                 if quantized_model_info['projector'] or i == len(encoder_model_list) - 1
                 else f'hidden_states_{i}'
             )
-            if len(subgraph.outputs) == 2:
-                out_name_list.append('encoder_output_1')
-                output_name_remap[subgraph.outputs[1]] = out_name_list[1]
+            # Patch F: 任何 chunk 的 secondary outputs 都用唯一 chunk-indexed 名命名，
+            # 跨 chunk 累积到 final_extra_output_names；最终作为合并 encoder model 的额外 outputs。
+            for _j_out in range(1, len(subgraph.outputs)):
+                _ds_name = f'extra_output_chunk{i}_idx{_j_out}'
+                output_name_remap[subgraph.outputs[_j_out]] = _ds_name
+                final_extra_output_names.append(_ds_name)
+                if not is_projector_chunk and _j_out == 1:
+                    deepstack_chunk_indices.append(i)
 
         logger.debug(f'[shape_fix_encoder] output_name_remap={output_name_remap}')
 
@@ -1030,7 +1051,9 @@ def shape_fix_encoder(
         else:
             name_mapping_dict = {}
             name_mapping_dict[subgraph.inputs[0]] = prev_subgraph_output
-            if num_non_lora_inputs > 1:
+            # Patch F: projector 的 inputs[1..] 已通过 input_name_remap 命名为
+            # 'extra_output_chunkN_idx1'，靠 builder 自动 name match 连接，不走 audio_attn_mask 路径。
+            if num_non_lora_inputs > 1 and not is_projector_chunk:
                 name_mapping_dict[subgraph.inputs[1]] = main_subgraph_inputs[1]
             logger.debug(f'[shape_fix_encoder] name_mapping_dict={name_mapping_dict}')
 
@@ -1051,7 +1074,9 @@ def shape_fix_encoder(
     pbar.close()
 
     input_names = ['encoder_input', *extra_inp_names, *lora_inp_names]
-    output_names = out_name_list
+    # Patch F: 把跨 chunk 累积的 secondary outputs 拼到最终 output_names 末尾
+    # （旧模型没有 secondary outputs 时 final_extra_output_names 为空，行为同前）
+    output_names = list(out_name_list) + final_extra_output_names
 
     logger.debug(f'[shape_fix_encoder] Finalized Input Names:\n{input_names}')
     logger.debug(f'[shape_fix_encoder] Finalized Output Names:\n{output_names}\n')
@@ -2257,9 +2282,11 @@ def main(args=None):
             curr_chunk_num_layer = num_layers_per_chunk[curr_chunk_idx]
             num_non_lora_inputs = quantized_model_info['num_non_lora_inputs']
             # FIXME: dont use this to determine start idx of num cache
+            # Patch F: 减去 num_extra_inputs（如 deepstack ds_padded）以保持 cache 索引正确；
+            # 默认 0，向下兼容旧模型 info JSON。
             num_non_cache_inputs = quantized_model_info['num_non_cache_inputs'] - quantized_model_info.get(
                 'num_other_masks_inputs', 0
-            )
+            ) - quantized_model_info.get('num_extra_inputs', 0)
 
             # rename all non-lora inputs
             input_name_remap = OrderedDict()
@@ -2417,6 +2444,9 @@ def main(args=None):
                                         elif quantized_model_info['model_config'].get('use_split_mask', False):
                                             if j == 6:
                                                 input_name_remap[subgraph.inputs[j]] = 'split_mask'
+                                            elif j == 7 and quantized_model_info.get('num_extra_inputs', 0) >= 1:
+                                                # Patch F: ds_padded 用 chunk-specific 命名，让各 chunk 各自暴露成独立 model input
+                                                input_name_remap[subgraph.inputs[j]] = f'ds_padded_{inner_layer_idx}'
                                             else:
                                                 logger.error('Too many non-lora inputs!')
                                         else:
@@ -2591,7 +2621,9 @@ def main(args=None):
                         elif quantized_model_info['model_config'].get('use_split_mask', False):
                             # FIXME: support infini and split mask together
                             # split mask
-                            name_mapping_dict[subgraph.inputs[num_non_lora_inputs - 1]] = 'split_mask'
+                            # Patch F: split_mask sits before any extra inputs (e.g., ds_padded)
+                            _sm_extra = quantized_model_info.get('num_extra_inputs', 0)
+                            name_mapping_dict[subgraph.inputs[num_non_lora_inputs - 1 - _sm_extra]] = 'split_mask'
 
                 name_mapping_dict[subgraph.inputs[0]] = prev_subgraph_output
                 logger.debug(f'name_mapping_dict={name_mapping_dict}')

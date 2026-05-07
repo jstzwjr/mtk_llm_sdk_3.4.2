@@ -176,11 +176,14 @@ def _intra_chunk_qparam_alignment(subgraph, config, quantized_model_info):
     logger.debug('Performing intra-chunk qparam alignment')
     num_non_cache_inputs = quantized_model_info['num_non_cache_inputs']
     num_other_masks_inputs = quantized_model_info['num_other_masks_inputs']
+    # Patch F: deepstack-style 额外 inputs（位于 split_mask 之后），与 shape_fix_llm 同样减去；
+    # 默认 0，旧模型 info 不带该字段时行为不变。
+    num_extra_inputs = quantized_model_info.get('num_extra_inputs', 0)
 
     if quantized_model_info['model_type'] == 'whisper_decoder':
         num_non_cache_inputs -= 2  # remove cross attn here
 
-    cache_start_idx = num_non_cache_inputs - num_other_masks_inputs
+    cache_start_idx = num_non_cache_inputs - num_other_masks_inputs - num_extra_inputs
     cache_outputs = subgraph.outputs[1:3] if config.extra_output['attn_weights'] else subgraph.outputs[1:]
 
     if (
@@ -501,7 +504,9 @@ def change_cache_dtype(subgraph, config, chunk_idx, target_dtype, quantized_mode
     target_np_dtype = _make_dtype_numpy(target_dtype)
 
     # FIXME: make more generic using start index
-    num_non_cache_inputs = quantized_model_info['num_non_cache_inputs'] - quantized_model_info['num_other_masks_inputs']
+    # Patch F: subtract num_extra_inputs (e.g. ds_padded) so cache index 计算与
+    # _intra_chunk_qparam_alignment 一致；默认 0 时行为不变。
+    num_non_cache_inputs = quantized_model_info['num_non_cache_inputs'] - quantized_model_info['num_other_masks_inputs'] - quantized_model_info.get('num_extra_inputs', 0)
     if quantized_model_info['model_type'] == 'whisper_decoder':
         num_non_cache_inputs -= 2  # remove cross attn here
 
@@ -1230,6 +1235,14 @@ def extract_llm_quantized_model_info(quantized_model_path_or_subgraph, pipeline=
     num_cache_inputs = 0 if (tail and model_type != 'eagle') else 2 + 2 * int(infini_attention)
     num_other_masks_inputs = 0 if tail else int(infini_attention) + int(use_split_mask)
     num_non_cache_inputs = num_non_lora_inputs - num_cache_inputs
+    # NEW (Patch F): deepstack ds_padded 计入"extra inputs"。位于 cache + split_mask 之后，
+    # 在 trace 顺序里 idx=7（仅 chunks < _num_deepstack_inject 的 LLM chunk 持有）。
+    # 默认 0，旧模型/旧配置不受影响。
+    num_extra_inputs = 0
+    if not tail:
+        _ds_inject = int(getattr(pipeline.config.l, '_num_deepstack_inject', 0) or 0)
+        if _ds_inject > 0 and chunk_idx is not None and chunk_idx < _ds_inject:
+            num_extra_inputs = 1
 
     input_tensor = subgraph.tensor_map[subgraph.inputs[0]]
     input_tensor_shape = tensor_utils.get_shape(input_tensor).as_list()
@@ -1301,6 +1314,7 @@ def extract_llm_quantized_model_info(quantized_model_path_or_subgraph, pipeline=
         'num_cache_inputs': num_cache_inputs,
         'num_non_lora_inputs': num_non_lora_inputs,
         'num_lora_inputs': num_lora_inputs,
+        'num_extra_inputs': num_extra_inputs,
         'input_scales': input_scales,
         'output_scales': output_scales,
         'input_zero_points': input_zero_points,
@@ -1820,9 +1834,11 @@ def merge_quantized_model_infos(quantized_model_infos):
             num_non_cache_inputs = quantized_model_infos[i]['num_non_cache_inputs']
             num_cache_inputs = quantized_model_infos[i]['num_cache_inputs']
             num_other_masks_inputs = quantized_model_infos[i].get('num_other_masks_inputs', 0)
+            # Patch F: 同上，减 num_extra_inputs 以保持 cache 索引正确
+            num_extra_inputs = quantized_model_infos[i].get('num_extra_inputs', 0)
 
             # FIXME: currently other masks are behind cache, so need to handle like this
-            cache_inputs_start_idx = num_non_cache_inputs - num_other_masks_inputs
+            cache_inputs_start_idx = num_non_cache_inputs - num_other_masks_inputs - num_extra_inputs
             cache_inputs_end_idx = cache_inputs_start_idx + num_cache_inputs
             if quantized_model_infos[i]['model_type'] == 'whisper_decoder':
                 cache_inputs_start_idx -= 2

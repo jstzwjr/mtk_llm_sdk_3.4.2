@@ -1127,6 +1127,47 @@ class FloatPipeline(BasePipeline):
             ):
                 logger.debug(f'num_lora_inputs dtype: {self.lora_handler.llm_lora_inputs[i][0].dtype}')
 
+            # NEW (Patch E-fix): pre-scatter ds_padded BEFORE the calibration save block,
+            # so the save_dict can include ds_padded (used by Qwen3ModelChunk.get_ptq_inputs).
+            _extra_chunk_inputs = []
+            _ds_embeds = kwargs.get('deepstack_visual_embeds')
+            if _ds_embeds is not None and i < len(_ds_embeds):
+                _img_tok_id = getattr(self.config.l, 'image_token_id', None) or (self.config.l.kwargs.get('image_token_id') if hasattr(self.config.l, 'kwargs') and isinstance(self.config.l.kwargs, dict) else None)
+                if _img_tok_id is None:
+                    _img_tok_id = getattr(self.config.l.kwargs, 'image_token_id', None) if hasattr(self.config.l, 'kwargs') else None
+                ds_padded = torch.zeros_like(hidden_states)
+                if _img_tok_id is not None and curr_tokens is not None:
+                    _ct = torch.as_tensor(curr_tokens) if not isinstance(curr_tokens, torch.Tensor) else curr_tokens
+                    _batch_mask = (_ct == _img_tok_id)
+                    _n_in_batch = int(_batch_mask.sum().item())
+                    if _n_in_batch > 0:
+                        _consumed = getattr(self, '_deepstack_consumed', 0)
+                        _ds_full = _ds_embeds[i]
+                        _slice = _ds_full[_consumed:_consumed + _n_in_batch]
+                        if _slice.shape[0] != _n_in_batch:
+                            logger.warning(
+                                f'[deepstack] layer {i}: slice shape {_slice.shape} != n_in_batch {_n_in_batch}; '
+                                f'consumed={_consumed} ds_full_len={_ds_full.shape[0]}'
+                            )
+                        _slice = _slice.to(device=ds_padded.device, dtype=ds_padded.dtype)
+                        _bm = _batch_mask.to(ds_padded.device)
+                        if _bm.dim() == 1:
+                            _bm = _bm.unsqueeze(0)
+                        _T_full = ds_padded.shape[1]
+                        _T_real = _bm.shape[-1]
+                        if _T_real < _T_full:
+                            _pad = torch.zeros(_bm.shape[0], _T_full - _T_real, dtype=torch.bool, device=_bm.device)
+                            _bm = torch.cat([_pad, _bm], dim=-1)
+                        elif _T_real > _T_full:
+                            _bm = _bm[:, -_T_full:]
+                        ds_padded[_bm] = _slice
+                        if i == len(_ds_embeds) - 1:
+                            self._deepstack_consumed = _consumed + _n_in_batch
+                            logger.debug(
+                                f'[deepstack] batch advanced cursor: {_consumed} -> {_consumed + _n_in_batch}'
+                            )
+                _extra_chunk_inputs.append(ds_padded)
+
             save_chunk = self.backend == const.CONVERTER or (self.backend == const.MLKITS and i == 0)
             if self.task == 'make_calibration' and save_chunk:
                 logger.debug(f'Save LLM calibration batch (layer {i})')
@@ -1137,6 +1178,9 @@ class FloatPipeline(BasePipeline):
                     'past_keys': cache_in[0].cpu().numpy().astype(np.float32),
                     'past_values': cache_in[1].cpu().numpy().astype(np.float32),
                 }
+                # NEW (Patch E-fix): save ds_padded for chunks that have deepstack injection
+                if _extra_chunk_inputs:
+                    save_dict['ds_padded'] = _extra_chunk_inputs[0].cpu().numpy().astype(np.float32)
                 if self.config.l.model_type == 'gecko' and i == 0:
                     assert len(pos_emb) == 3
                     save_dict.update(
@@ -1242,47 +1286,6 @@ class FloatPipeline(BasePipeline):
                 )
                 if len(lora_mapping_files) > 0:
                     lora_mapping_files[i].write(self.lora_handler.lora_config_paths[0] + '\n')
-
-            # NEW (Patch E): pre-scatter deepstack embed -> ds_padded [1, T, D] (零初始 + image 位置填值)
-            # 然后把 ds_padded 作为额外位置参数传入 chunk forward；chunk 内只做 hidden + ds_padded（DLA-friendly）。
-            _extra_chunk_inputs = []
-            _ds_embeds = kwargs.get('deepstack_visual_embeds')
-            if _ds_embeds is not None and i < len(_ds_embeds):
-                _img_tok_id = getattr(self.config.l, 'image_token_id', None) or (self.config.l.kwargs.get('image_token_id') if hasattr(self.config.l, 'kwargs') and isinstance(self.config.l.kwargs, dict) else None)
-                if _img_tok_id is None:
-                    _img_tok_id = getattr(self.config.l.kwargs, 'image_token_id', None) if hasattr(self.config.l, 'kwargs') else None
-                ds_padded = torch.zeros_like(hidden_states)
-                if _img_tok_id is not None and curr_tokens is not None:
-                    _ct = torch.as_tensor(curr_tokens) if not isinstance(curr_tokens, torch.Tensor) else curr_tokens
-                    _batch_mask = (_ct == _img_tok_id)
-                    _n_in_batch = int(_batch_mask.sum().item())
-                    if _n_in_batch > 0:
-                        _consumed = getattr(self, '_deepstack_consumed', 0)
-                        _ds_full = _ds_embeds[i]
-                        _slice = _ds_full[_consumed:_consumed + _n_in_batch]
-                        if _slice.shape[0] != _n_in_batch:
-                            logger.warning(
-                                f'[deepstack] layer {i}: slice shape {_slice.shape} != n_in_batch {_n_in_batch}; '
-                                f'consumed={_consumed} ds_full_len={_ds_full.shape[0]}'
-                            )
-                        _slice = _slice.to(device=ds_padded.device, dtype=ds_padded.dtype)
-                        _bm = _batch_mask.to(ds_padded.device)
-                        if _bm.dim() == 1:
-                            _bm = _bm.unsqueeze(0)
-                        _T_full = ds_padded.shape[1]
-                        _T_real = _bm.shape[-1]
-                        if _T_real < _T_full:
-                            _pad = torch.zeros(_bm.shape[0], _T_full - _T_real, dtype=torch.bool, device=_bm.device)
-                            _bm = torch.cat([_pad, _bm], dim=-1)
-                        elif _T_real > _T_full:
-                            _bm = _bm[:, -_T_full:]
-                        ds_padded[_bm] = _slice
-                        if i == len(_ds_embeds) - 1:
-                            self._deepstack_consumed = _consumed + _n_in_batch
-                            logger.debug(
-                                f'[deepstack] batch advanced cursor: {_consumed} -> {_consumed + _n_in_batch}'
-                            )
-                _extra_chunk_inputs.append(ds_padded)
 
             logger.debug(f'Forward LLM (chunk {i})')
             model_out = self.llm[i](

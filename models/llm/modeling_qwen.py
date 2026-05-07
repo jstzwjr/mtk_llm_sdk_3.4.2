@@ -1299,8 +1299,8 @@ class Qwen3ModelChunk(ModelChunk):
         ds_input = torch.zeros_like(base)
         return (base, ds_input)
 
-    def get_ptq_inputs(self, *args, **kwargs):
-        result = super().get_ptq_inputs(*args, **kwargs)
+    def get_ptq_inputs(self, *_args_pos, **kwargs):
+        result = super().get_ptq_inputs(*_args_pos, **kwargs)
         if not self._inject_ds:
             return result
         input_shapes, input_value_ranges, calib_data_gen, eval_data_gen = result
@@ -1309,16 +1309,38 @@ class Qwen3ModelChunk(ModelChunk):
         new_input_shapes = list(input_shapes) + [ds_shape]
         new_input_value_ranges = list(input_value_ranges) + [None]
 
-        def _wrap_gen(orig_gen, ds_shape):
+        # NEW (Patch E-fix): try to read real ds_padded from npz (saved by pipeline.forward_llm_float
+        # in make_calibration mode). args 第一项为 PTQ args 对象，含 calibration_dataset。
+        ptq_args = _args_pos[0] if _args_pos else None
+        calib_dir = None
+        if ptq_args is not None and getattr(ptq_args, 'calibration_dataset', None) not in (None, 'fake'):
+            calib_dir = os.path.join(ptq_args.calibration_dataset, 'llm', f'chunk_{self.chunk_idx}')
+
+        def _wrap_gen(orig_gen, ds_shape, calib_dir):
             def _new():
+                npz_files = None
+                if calib_dir is not None and os.path.isdir(calib_dir):
+                    npz_files = utils.get_sorted_path_list(calib_dir, '.npz', sep='-')
+                idx = 0
                 for batch in orig_gen():
-                    ds = np.zeros(ds_shape, dtype=np.float32)
+                    if npz_files is not None and idx < len(npz_files):
+                        try:
+                            data = np.load(npz_files[idx])
+                            if 'ds_padded' in data.files:
+                                ds = data['ds_padded'].astype(np.float32)
+                            else:
+                                ds = np.zeros(ds_shape, dtype=np.float32)
+                        except Exception:
+                            ds = np.zeros(ds_shape, dtype=np.float32)
+                    else:
+                        ds = np.zeros(ds_shape, dtype=np.float32)
+                    idx += 1
                     yield [*batch, ds]
             return _new
 
         return (
             new_input_shapes,
             new_input_value_ranges,
-            _wrap_gen(calib_data_gen, ds_shape),
-            _wrap_gen(eval_data_gen, ds_shape),
+            _wrap_gen(calib_data_gen, ds_shape, calib_dir),
+            _wrap_gen(eval_data_gen, ds_shape, calib_dir),
         )
