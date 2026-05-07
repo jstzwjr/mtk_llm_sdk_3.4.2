@@ -1748,6 +1748,16 @@ def fix_llm_shape(
                 )
 
             target_shapes = target_shapes + cache_shapes + other_mask_shapes
+            # Patch F8: deepstack ds_padded_<i> inputs 同形于 inputs_embeds，按实际 model 中
+            # 名为 'ds_padded_*' 的 input 个数加 shape，避免 reconfigure_input_shapes 报 mismatch。
+            try:
+                _sg = quantized_model_utils.get_subgraph_from_quantized_model(quantized_model_path)
+                _ds_count = sum(1 for _inp in _sg.inputs if _inp.startswith('ds_padded'))
+            except Exception:
+                _ds_count = 0
+            if _ds_count > 0:
+                ds_padded_shape = [batch_size, num_token, quantized_model_info['hidden_size']]
+                target_shapes = target_shapes + [list(ds_padded_shape) for _ in range(_ds_count)]
             target_shapes = target_shapes + lora_shapes_unpacked  # Lora inputs
 
         logger.debug(f'[fix_llm_shape] target_shapes={target_shapes}')
@@ -2756,7 +2766,20 @@ def main(args=None):
                             input_names.insert(mask_index + 1, 'split_mask')
                         except ValueError:
                             logger.error('Split mask is currently unsupported for this model.')
-                    input_names = input_names + cache_inputs + other_mask_input + lora_inp_names
+                    # Patch F7: deepstack ds_padded_<inner_idx> 在合并 LLM 模型里也是 model-level inputs，
+                    # 必须出现在 input_names 才能让 builder.export 不报 "Missing some of the subgraph inputs"。
+                    ds_padded_inputs = []
+                    for _inner_idx in range(curr_chunk_num_layer):
+                        # 仅当该层在 PTQ 时被标了 num_extra_inputs（即 chunks 0..num_deepstack_inject-1）才有 ds_padded
+                        try:
+                            _layer_info = curr_chunk_quantized_model_infos[_inner_idx]
+                        except (NameError, IndexError):
+                            _layer_info = None
+                        _n_extra = (_layer_info.get('num_extra_inputs', 0) if _layer_info else 0)
+                        for _e in range(_n_extra):
+                            ds_padded_inputs.append(f'ds_padded_{_inner_idx}' if _e == 0 else f'ds_padded_{_inner_idx}_{_e}')
+
+                    input_names = input_names + cache_inputs + other_mask_input + ds_padded_inputs + lora_inp_names
                     cache_outputs = []
                     for idx in range(curr_chunk_num_layer):
                         cache_outputs.extend(
