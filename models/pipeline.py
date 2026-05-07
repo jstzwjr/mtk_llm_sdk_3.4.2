@@ -2580,11 +2580,37 @@ class QuantizedPipeline(BasePipeline):
 
         out = model_out
 
+        # Phase 4 (deepstack-quant): For Qwen3-VL the merged encoder tflite emits 7 outputs:
+        #   [0]    main image embedding (LLM hidden_dim, ready to fill image-token slots)
+        #   [1..3] raw deepstack tap (chunk 5/11/17 hidden_states, internal flow only —
+        #          they're already consumed by the projector; safe to discard here)
+        #   [4..6] projector deepstack embeddings #0/#1/#2 (LLM hidden_dim,
+        #          ready to scatter into LLM ds_padded inputs)
+        # Detect deepstack mode and expose the 3 useful tensors via kwargs so that
+        # forward_llm_quantized can later scatter them per-batch.
+        _ds_indexes_cfg = (
+            getattr(self.config.e, 'deepstack_visual_indexes', None) if self.config.e is not None else None
+        )
+        if _ds_indexes_cfg and len(out) >= (1 + 2 * len(_ds_indexes_cfg)):
+            # Take the LAST `len(_ds_indexes_cfg)` outputs as deepstack embeddings
+            # (matches shape_fix_encoder ordering: projector secondary outputs come last).
+            n_ds = len(_ds_indexes_cfg)
+            kwargs['deepstack_visual_embeds'] = list(out[-n_ds:])
+            self._deepstack_consumed = 0
+            logger.debug(
+                f'[deepstack-quant] encoder produced {len(out)} outputs; '
+                f'cached {n_ds} deepstack embeds; first shape={out[-n_ds].shape}'
+            )
+
         # Check if model out contains cross attention or not
         if len(out) == 1:
             outputs.append(out[0])
         elif len(out) == 2:  # Minimum 3 output if model contains cross attention
             outputs.append(out)
+        elif kwargs.get('deepstack_visual_embeds') is not None:
+            # Deepstack case: only [0] is the main embed; the rest are deepstack
+            # (already saved into kwargs above).
+            outputs.append(out[0])
         else:
             outputs.append(out[0])
             cross_attns.append(out[1:])
@@ -2598,7 +2624,13 @@ class QuantizedPipeline(BasePipeline):
         return outputs, cross_attns, kwargs
 
     def forward_projector(self, inputs, **kwargs):
-        """Do Nothing. Projector is expected to be inside encoder."""
+        """Do Nothing. Projector is expected to be inside encoder.
+
+        Phase 4 (deepstack-quant) note: for Qwen3-VL the projector is fused into the
+        merged encoder tflite, so the deepstack mergers are already applied. The
+        deepstack output buffers were extracted in forward_encoder and stashed in
+        kwargs['deepstack_visual_embeds']; we just pass them through unchanged.
+        """
         return inputs, kwargs
 
     @torch.no_grad()
@@ -2768,7 +2800,62 @@ class QuantizedPipeline(BasePipeline):
             if len(self.lora_handler.llm_lora_inputs[i]) > 0:
                 logger.debug(f'num_lora_inputs dtype: {self.lora_handler.llm_lora_inputs[i][0].dtype}')
 
-            model_in = [hidden_states, *mask, *pos_emb, *cache_in, *other_masks, *self.lora_handler.llm_lora_inputs[i]]
+            # Phase 4 (deepstack-quant): pre-scatter ds_padded numpy buffers for the current
+            # batch and append them to the executor input list. The merged LLM tflite expects
+            # ds_padded_0/1/2 at the END of its input list (idx 77/78/79 for Qwen3-VL @ 640).
+            # Mirrors the FloatPipeline pre-scatter logic (same image-token cursor semantics).
+            _ds_extra_inputs = []
+            _ds_embeds = kwargs.get('deepstack_visual_embeds')
+            if _ds_embeds is not None and len(_ds_embeds) > 0:
+                _img_tok_id = (
+                    getattr(self.config.l, 'image_token_id', None)
+                    or (self.config.l.kwargs.get('image_token_id')
+                        if hasattr(self.config.l, 'kwargs') and isinstance(self.config.l.kwargs, dict)
+                        else None)
+                )
+                if _img_tok_id is None:
+                    _img_tok_id = getattr(self.config.l.kwargs, 'image_token_id', None) if hasattr(self.config.l, 'kwargs') else None
+                _T_full = hidden_states.shape[1]
+                _hidden_dim = hidden_states.shape[2]
+                _ds_dtype = _ds_embeds[0].dtype
+                # Pre-allocate per-deepstack zero buffer [1, T_full, D].
+                _ds_paddeds = [np.zeros((1, _T_full, _hidden_dim), dtype=_ds_dtype)
+                               for _ in _ds_embeds]
+                if _img_tok_id is not None and curr_tokens is not None:
+                    _ct = np.asarray(curr_tokens).reshape(-1)
+                    _batch_mask = (_ct == _img_tok_id)
+                    _n_in_batch = int(_batch_mask.sum())
+                    if _n_in_batch > 0:
+                        _consumed = getattr(self, '_deepstack_consumed', 0)
+                        # Align mask to padded shape (left-pad → leading False).
+                        _T_real = _batch_mask.shape[0]
+                        if _T_real < _T_full:
+                            _pad = np.zeros(_T_full - _T_real, dtype=bool)
+                            _bm = np.concatenate([_pad, _batch_mask], axis=0)
+                        elif _T_real > _T_full:
+                            _bm = _batch_mask[-_T_full:]
+                        else:
+                            _bm = _batch_mask
+                        for _k, _ds_full in enumerate(_ds_embeds):
+                            _slice = _ds_full[_consumed:_consumed + _n_in_batch]
+                            if _slice.shape[0] == _n_in_batch:
+                                _ds_paddeds[_k][0, _bm, :] = _slice.astype(_ds_dtype, copy=False)
+                            else:
+                                logger.warning(
+                                    f'[deepstack-quant] slice shape {_slice.shape} != n_in_batch {_n_in_batch} '
+                                    f'(consumed={_consumed} ds_full_len={_ds_full.shape[0]} k={_k}); skipping'
+                                )
+                        # advance cursor only after building all deepstack buffers for this batch
+                        self._deepstack_consumed = _consumed + _n_in_batch
+                        logger.debug(
+                            f'[deepstack-quant] batch advanced cursor: {_consumed} -> {self._deepstack_consumed}'
+                        )
+                _ds_extra_inputs = _ds_paddeds
+
+            model_in = [
+                hidden_states, *mask, *pos_emb, *cache_in, *other_masks,
+                *self.lora_handler.llm_lora_inputs[i], *_ds_extra_inputs,
+            ]
             executor = curr_models[i]
 
             logger.debug('Quantize inputs')
