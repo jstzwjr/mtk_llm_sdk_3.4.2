@@ -766,6 +766,10 @@ class FloatPipeline(BasePipeline):
                     keys_to_keep.append(key)
                     logger.debug(f'Keeping key: {key}')
 
+        # Patch F6: filter visual.* keys (vision encoder + projector weights) so partial-tail PTQ
+        # doesn't mis-load visual.merger.norm.weight as Qwen tail norm.weight (shape mismatch 1024 vs 2560).
+        keys_to_keep = [k for k in keys_to_keep if not k.startswith('visual.')]
+
         self.state_dict['llm'] = {key: self.state_dict['llm'][key] for key in keys_to_keep}
         logger.debug(f'Updated tensor names in state dict:\n{self.state_dict["llm"].keys()}')
 

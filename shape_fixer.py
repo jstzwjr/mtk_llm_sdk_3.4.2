@@ -939,16 +939,11 @@ def shape_fix_encoder(
         input_name_remap[subgraph.inputs[0]] = 'encoder_input'
         if num_non_lora_inputs > 1:
             if is_projector_chunk:
-                # Patch F: projector 多输入对接前面 encoder chunks 的 secondary outputs。
-                # 用与 encoder chunk 输出相同的命名（extra_output_chunkN_idxK），
-                # builder 通过 name match 自动 wire 起来。
+                # Patch F6: projector inputs[1..] 起 neutral 名字（避免与 encoder chunks 已暴露的
+                # secondary outputs 同名导致 builder.import_subgraph 报 conflict）；
+                # 真正的连接通过 name_mapping_dict（在 import 阶段做映射）实现。
                 for _k_in in range(1, num_non_lora_inputs):
-                    if _k_in - 1 < len(deepstack_chunk_indices):
-                        _src_chunk = deepstack_chunk_indices[_k_in - 1]
-                        input_name_remap[subgraph.inputs[_k_in]] = f'extra_output_chunk{_src_chunk}_idx1'
-                    else:
-                        # 兜底：deepstack 数与 projector input 数对不上时，给唯一名字避免冲突
-                        input_name_remap[subgraph.inputs[_k_in]] = f'projector_extra_input_{_k_in}'
+                    input_name_remap[subgraph.inputs[_k_in]] = f'projector_input_{_k_in}'
             else:
                 input_name_remap[subgraph.inputs[1]] = 'audio_attn_mask'
                 extra_inp_names.add('audio_attn_mask')
@@ -1051,9 +1046,15 @@ def shape_fix_encoder(
         else:
             name_mapping_dict = {}
             name_mapping_dict[subgraph.inputs[0]] = prev_subgraph_output
-            # Patch F: projector 的 inputs[1..] 已通过 input_name_remap 命名为
-            # 'extra_output_chunkN_idx1'，靠 builder 自动 name match 连接，不走 audio_attn_mask 路径。
-            if num_non_lora_inputs > 1 and not is_projector_chunk:
+            if is_projector_chunk:
+                # Patch F6: projector inputs[1..]（已 rename 为 'projector_input_<k>'）显式映射到
+                # 前面 encoder chunks 暴露的 secondary outputs 名字，让 builder 在 import 时替换为
+                # 已存在的 tensor，从而正确连接 deepstack 通路。
+                for _k_in in range(1, num_non_lora_inputs):
+                    if _k_in - 1 < len(deepstack_chunk_indices):
+                        _src_chunk = deepstack_chunk_indices[_k_in - 1]
+                        name_mapping_dict[f'projector_input_{_k_in}'] = f'extra_output_chunk{_src_chunk}_idx1'
+            elif num_non_lora_inputs > 1:
                 name_mapping_dict[subgraph.inputs[1]] = main_subgraph_inputs[1]
             logger.debug(f'[shape_fix_encoder] name_mapping_dict={name_mapping_dict}')
 
